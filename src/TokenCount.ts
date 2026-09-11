@@ -49,3 +49,22 @@ export function toPromptUsage(tokenCount: TokenCount): Usage {
         thoughtTokens: tokenCount.reasoningOutputTokens,
     };
 }
+
+/** Accumulate a prompt from cumulative counters; the first sample after a cold
+ * resume uses its last response, excluding pre-existing session usage. Repeated
+ * notifications add nothing. Counter regressions are unknown accounting, not
+ * zero cost or permission to invent a new baseline mid-prompt. */
+export function addPromptTokenUsage(
+    accumulated: TokenCount | null,
+    previousTotal: TokenCount | null,
+    total: TokenCount,
+    last: TokenCount,
+): TokenCount | null {
+    const result = {...total};
+    for (const key of Object.keys(total) as Array<keyof TokenCount>) {
+        const increment = previousTotal == null ? last[key] : total[key] - previousTotal[key];
+        if (!Number.isFinite(increment) || increment < 0) return null;
+        result[key] = (accumulated?.[key] ?? 0) + increment;
+    }
+    return result;
+}
