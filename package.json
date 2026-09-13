@@ -1,9 +1,9 @@
 {
-  "name": "@agentclientprotocol/codex-acp",
+  "name": "@productfactory/codex-acp",
   "publishConfig": {
     "access": "public"
   },
-  "version": "1.10.0",
+  "version": "1.10.0-factory.1",
   "description": "",
   "main": "dist/index.js",
   "bin": {
@@ -50,7 +50,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/agentclientprotocol/codex-acp.git"
+    "url": "git+https://github.com/productfactory-co/codex-acp.git"
   },
   "keywords": [],
   "author": "Agent Client Protocol",
