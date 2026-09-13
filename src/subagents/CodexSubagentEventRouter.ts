@@ -291,6 +291,10 @@ export class CodexSubagentEventRouter {
         }
     }
 
+    ownsThread(threadId: string): boolean {
+        return threadId === this.rootSessionId || this.isKnownChild(threadId);
+    }
+
     private isKnownChild(threadId: string): boolean {
         return threadId !== this.rootSessionId
             && (this.children.has(threadId)

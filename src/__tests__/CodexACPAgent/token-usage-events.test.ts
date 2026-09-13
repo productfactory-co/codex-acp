@@ -1,4 +1,6 @@
 import {CodexEventHandler} from "../../CodexEventHandler";
+import {CodexSubagentEventRouter} from "../../subagents/CodexSubagentEventRouter";
+import {ACPSessionConnection} from "../../ACPSessionConnection";
 import type {AcpClientConnection} from "../../ACPSessionConnection";
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ServerNotification } from '../../app-server';
@@ -213,7 +215,13 @@ describe('Token Usage Events', () => {
     it('counts interleaved root and child counters independently', async () => {
         const state = createTestSessionState({sessionId});
         const notify = vi.fn(async () => {});
-        const handler = new CodexEventHandler({notify} as unknown as AcpClientConnection, state);
+        const connection = {notify} as unknown as AcpClientConnection;
+        const router = new CodexSubagentEventRouter(sessionId, true, new ACPSessionConnection(connection, sessionId));
+        const handler = new CodexEventHandler(connection, state, false, false, "test", router);
+        await handler.handleNotification({method: "item/started", params: {threadId: sessionId, turnId: "turn-id", startedAtMs: 1, item: {
+            type: "collabAgentToolCall", id: "spawn", tool: "spawnAgent", senderThreadId: sessionId,
+            receiverThreadIds: ["child"], agentsStates: {}, status: "inProgress", prompt: "Help", model: null, reasoningEffort: null,
+        }}});
         const breakdown = (tokens: number): TokenUsageBreakdown => ({totalTokens: tokens, inputTokens: tokens,
             outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, reasoningOutputTokens: 0});
         const event = (threadId: string, total: number, last: number) => createTokenUsageNotification(threadId, {
@@ -233,6 +241,17 @@ describe('Token Usage Events', () => {
         await handler.handleNotification(event('child', 300, 100));
         await handler.handleNotification(event(sessionId, 2500, 500));
         expect(state.promptTokenUsage).toMatchObject({totalTokens: 600});
+        // A fast child can finish before its transcript is materialized. Its
+        // already-observed usage remains accounted and foreign threads do not.
+        await handler.handleNotification({method: "turn/completed", params: {threadId: "child",
+            turn: {id: "child-turn", status: "completed", items: [], itemsView: "full", error: null, startedAt: null, completedAt: null, durationMs: null}}});
+        await handler.handleNotification(event("unrelated-session", 9000, 9000));
+        expect(state.promptTokenUsage).toMatchObject({totalTokens: 600});
+        expect(state.promptHasChildUsage).toBe(true);
+        // Replaying an old presentation event is not a counter regression.
+        await handler.handleNotification(event("child", 100, 100), true);
+        expect(state.promptTokenUsage).toMatchObject({totalTokens: 600});
+        expect(state.promptUsageIncomplete).toBe(false);
     });
 
     describe('session/update usage_update', () => {

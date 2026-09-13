@@ -372,7 +372,13 @@ export class CodexEventHandler {
         return plan;
     }
 
-    async handleNotification(notification: ServerNotification) {
+    async handleNotification(notification: ServerNotification, replayed = false) {
+        // Usage is an accounting fact, independent of buffered transcript
+        // presentation. Replayed child events must not reapply older counters.
+        if (!replayed && notification.method === "thread/tokenUsage/updated"
+            && this.subagents.ownsThread(notification.params.threadId)) {
+            this.handleTokenUsageUpdated(notification.params);
+        }
         await this.flushPendingErrors();
         const closingChildren = this.subagents.closingChildSessions(notification);
         for (const child of closingChildren) {
@@ -380,7 +386,7 @@ export class CodexEventHandler {
         }
         const handledBySubagents = await this.subagents.handle(notification);
         for (const buffered of this.subagents.takeBufferedNotifications()) {
-            await this.handleNotification(buffered);
+            await this.handleNotification(buffered, true);
         }
         const ignoredBySubagents = !handledBySubagents && this.subagents.shouldIgnore(notification);
         let updateEvent: UpdateSessionEvent | null | undefined;
@@ -1297,14 +1303,16 @@ export class CodexEventHandler {
         totals.set(params.threadId, total);
         // Prompt accounting includes observed child work; the session context
         // gauge and compatibility baseline describe only the root thread.
-        if (params.threadId !== this.sessionState.sessionId) return;
+        if (params.threadId !== this.sessionState.sessionId) {
+            this.sessionState.promptHasChildUsage = true;
+            return;
+        }
         this.sessionState.lastTokenUsage = last;
         this.sessionState.totalTokenUsage = total;
         this.sessionState.modelContextWindow = params.tokenUsage.modelContextWindow;
     }
 
     private createUsageUpdate(params: ThreadTokenUsageUpdatedNotification): UpdateSessionEvent | null {
-        this.handleTokenUsageUpdated(params);
         if (params.threadId !== this.sessionState.sessionId) return null;
 
         const used = this.sessionState.lastTokenUsage?.totalTokens;

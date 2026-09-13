@@ -165,6 +165,7 @@ export interface SessionState {
     promptTokenUsage?: TokenCount | null;
     tokenUsageByThread?: Map<string, TokenCount>;
     promptUsageIncomplete?: boolean;
+    promptHasChildUsage?: boolean;
     modelContextWindow: number | null;
     rateLimits: RateLimitsMap | null;
     account: Account | null;
@@ -2758,6 +2759,7 @@ export class CodexAcpServer {
         const activePrompt = this.trackActivePrompt(params.sessionId);
         sessionState.promptTokenUsage = null;
         sessionState.promptUsageIncomplete = false;
+        sessionState.promptHasChildUsage = false;
         let pendingTurnStart: PendingTurnStart | null = null;
         const ensurePendingTurnStart = (): PendingTurnStart => {
             if (pendingTurnStart === null) {
@@ -3282,8 +3284,9 @@ export class CodexAcpServer {
         // Remove the "[reasoning-level]" suffix from currentModelId if present
         const modelName = sessionState.currentModelId.replace(/\[.*?]$/, '');
 
-        // FIXME: currently all tokens are reported for the current model
-        const modelUsage = (lastTokenUsage != null)
+        // Child token notifications do not identify their model. Keep the aggregate
+        // but omit a model breakdown we cannot prove.
+        const modelUsage = (lastTokenUsage != null && !sessionState.promptHasChildUsage)
             ? [{ model: modelName, token_count: lastTokenUsage }]
             : [];
 
