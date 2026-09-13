@@ -373,6 +373,7 @@ export class CodexEventHandler {
     }
 
     async handleNotification(notification: ServerNotification, replayed = false) {
+        if (!replayed) this.subagents.observeAccountingOwnership(notification);
         // Usage is an accounting fact, independent of buffered transcript
         // presentation. Replayed child events must not reapply older counters.
         if (!replayed && notification.method === "thread/tokenUsage/updated"

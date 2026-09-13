@@ -254,6 +254,39 @@ describe('Token Usage Events', () => {
         expect(state.promptUsageIncomplete).toBe(false);
     });
 
+    it.each(['collaboration', 'activity'] as const)('counts descendants before their parent %s is materialized', async (shape) => {
+        const state = createTestSessionState({sessionId});
+        const connection = {notify: vi.fn(async () => {})} as unknown as AcpClientConnection;
+        const router = new CodexSubagentEventRouter(sessionId, true, new ACPSessionConnection(connection, sessionId));
+        const handler = new CodexEventHandler(connection, state, false, false, "test", router);
+        const spawn = (parent: string, child: string): ServerNotification => ({method: "item/started", params: {
+            threadId: parent, turnId: "turn-id", startedAtMs: 1, item: shape === "activity" ? {
+                type: "subAgentActivity", id: `activity-${child}`, kind: "started",
+                agentThreadId: child, agentPath: `/root/${parent}/${child}`,
+            } : {
+                type: "collabAgentToolCall", id: `spawn-${child}`, tool: "spawnAgent", senderThreadId: parent,
+                receiverThreadIds: [child], agentsStates: {}, status: "inProgress", prompt: "Help", model: null, reasoningEffort: null,
+            },
+        }});
+        const usage = (threadId: string, tokens: number) => {
+            const breakdown: TokenUsageBreakdown = {totalTokens: tokens, inputTokens: tokens,
+                outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, reasoningOutputTokens: 0};
+            return createTokenUsageNotification(threadId, {total: breakdown, last: breakdown, modelContextWindow: 10000});
+        };
+        await handler.handleNotification(spawn(sessionId, "child"));
+        await handler.handleNotification(spawn("child", "grandchild"));
+        await handler.handleNotification(spawn("foreign", "foreign-child"));
+        await handler.handleNotification(usage(sessionId, 100));
+        await handler.handleNotification(usage("child", 10));
+        await handler.handleNotification(usage("grandchild", 7));
+        await handler.handleNotification(usage("grandchild", 7));
+        await handler.handleNotification(usage("foreign-child", 500));
+        expect(state.promptTokenUsage?.totalTokens).toBe(117);
+        expect(state.promptUsageIncomplete).toBe(false);
+        await handler.handleNotification(usage("grandchild", 7), true);
+        expect(state.promptTokenUsage?.totalTokens).toBe(117);
+    });
+
     describe('session/update usage_update', () => {
         function setupPromptAndReturnEvents(notifications: ServerNotification[], turnStatus: string = "completed") {
             const codexAcpAgent = mockFixture.getCodexAcpAgent();
