@@ -39,7 +39,7 @@ import type {
     WarningNotification
 } from "./app-server/v2";
 import type { McpStartupCompleteEvent } from "./app-server/McpStartupCompleteEvent";
-import {toTokenCount} from "./TokenCount";
+import {addPromptTokenUsage, toTokenCount} from "./TokenCount";
 import {
     commandExecutionUsesTerminalOutput,
     createCommandExecutionUpdate,
@@ -372,7 +372,14 @@ export class CodexEventHandler {
         return plan;
     }
 
-    async handleNotification(notification: ServerNotification) {
+    async handleNotification(notification: ServerNotification, replayed = false) {
+        if (!replayed) this.subagents.observeAccountingOwnership(notification);
+        // Usage is an accounting fact, independent of buffered transcript
+        // presentation. Replayed child events must not reapply older counters.
+        if (!replayed && notification.method === "thread/tokenUsage/updated"
+            && this.subagents.ownsThread(notification.params.threadId)) {
+            this.handleTokenUsageUpdated(notification.params);
+        }
         await this.flushPendingErrors();
         const closingChildren = this.subagents.closingChildSessions(notification);
         for (const child of closingChildren) {
@@ -380,7 +387,7 @@ export class CodexEventHandler {
         }
         const handledBySubagents = await this.subagents.handle(notification);
         for (const buffered of this.subagents.takeBufferedNotifications()) {
-            await this.handleNotification(buffered);
+            await this.handleNotification(buffered, true);
         }
         const ignoredBySubagents = !handledBySubagents && this.subagents.shouldIgnore(notification);
         let updateEvent: UpdateSessionEvent | null | undefined;
@@ -1280,13 +1287,34 @@ export class CodexEventHandler {
     }
 
     private handleTokenUsageUpdated(params: ThreadTokenUsageUpdatedNotification): void {
-        this.sessionState.lastTokenUsage = toTokenCount(params.tokenUsage.last);
-        this.sessionState.totalTokenUsage = toTokenCount(params.tokenUsage.total);
+        const last = toTokenCount(params.tokenUsage.last);
+        const total = toTokenCount(params.tokenUsage.total);
+        const totals = this.sessionState.tokenUsageByThread ??= new Map();
+        const previousTotal = totals.get(params.threadId)
+            ?? (params.threadId === this.sessionState.sessionId ? this.sessionState.totalTokenUsage : null);
+        if (!this.sessionState.promptUsageIncomplete) {
+            this.sessionState.promptTokenUsage = addPromptTokenUsage(
+                this.sessionState.promptTokenUsage ?? null,
+                previousTotal,
+                total,
+                last,
+            );
+            this.sessionState.promptUsageIncomplete = this.sessionState.promptTokenUsage == null;
+        }
+        totals.set(params.threadId, total);
+        // Prompt accounting includes observed child work; the session context
+        // gauge and compatibility baseline describe only the root thread.
+        if (params.threadId !== this.sessionState.sessionId) {
+            this.sessionState.promptHasChildUsage = true;
+            return;
+        }
+        this.sessionState.lastTokenUsage = last;
+        this.sessionState.totalTokenUsage = total;
         this.sessionState.modelContextWindow = params.tokenUsage.modelContextWindow;
     }
 
     private createUsageUpdate(params: ThreadTokenUsageUpdatedNotification): UpdateSessionEvent | null {
-        this.handleTokenUsageUpdated(params);
+        if (params.threadId !== this.sessionState.sessionId) return null;
 
         const used = this.sessionState.lastTokenUsage?.totalTokens;
         const size = this.sessionState.modelContextWindow;

@@ -1,3 +1,7 @@
+import {CodexEventHandler} from "../../CodexEventHandler";
+import {CodexSubagentEventRouter} from "../../subagents/CodexSubagentEventRouter";
+import {ACPSessionConnection} from "../../ACPSessionConnection";
+import type {AcpClientConnection} from "../../ACPSessionConnection";
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ServerNotification } from '../../app-server';
 import { createCodexMockTestFixture, createTestSessionState, type CodexMockTestFixture } from '../acp-test-utils';
@@ -133,7 +137,7 @@ describe('Token Usage Events', () => {
             );
         });
 
-        it('should use last token usage from multiple updates', async () => {
+        it('should account for every model round in a prompt', async () => {
             const notifications: ServerNotification[] = [
                 createTokenUsageNotification(sessionId, {
                     total: { totalTokens: 1000, inputTokens: 800, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 200, reasoningOutputTokens: 0 },
@@ -163,6 +167,124 @@ describe('Token Usage Events', () => {
                 'data/token-usage-multiple-updates.json'
             );
         });
+    });
+
+    it('separates successive prompts and ignores duplicate usage notifications', async () => {
+        const agent = mockFixture.getCodexAcpAgent();
+        const state = createTestSessionState({sessionId});
+        vi.spyOn(agent, 'getSessionState').mockReturnValue(state);
+        mockFixture.getCodexAppServerClient().turnStart = vi.fn().mockResolvedValue({
+            turn: {id: "turn-id", items: [], status: "inProgress", error: null},
+        });
+        const breakdown = (input: number, output: number): TokenUsageBreakdown => ({
+            totalTokens: input + output, inputTokens: input, outputTokens: output,
+            cachedInputTokens: 0, cacheWriteInputTokens: 0, reasoningOutputTokens: 0,
+        });
+        let notifications = [
+            createTokenUsageNotification(sessionId, {total: breakdown(100, 10), last: breakdown(100, 10), modelContextWindow: 10000}),
+            createTokenUsageNotification(sessionId, {total: breakdown(300, 30), last: breakdown(200, 20), modelContextWindow: 10000}),
+        ];
+        notifications.push(notifications[1]!);
+        mockFixture.getCodexAppServerClient().awaitTurnCompleted = vi.fn().mockImplementation(async () => {
+            for (const notification of notifications) mockFixture.sendServerNotification(notification);
+            return {threadId: sessionId, turn: {id: "turn-id", items: [], status: "completed", error: null}};
+        });
+        const prompt = {sessionId, prompt: [{type: 'text' as const, text: 'test'}]};
+        expect((await agent.prompt(prompt)).usage).toMatchObject({inputTokens: 300, outputTokens: 30, totalTokens: 330});
+        expect(state.lastTokenUsage?.totalTokens).toBe(220);
+        expect(state.modelContextWindow).toBe(10000);
+        notifications = [createTokenUsageNotification(sessionId, {
+            total: breakdown(600, 60), last: breakdown(300, 30), modelContextWindow: 10000,
+        })];
+        expect((await agent.prompt(prompt)).usage).toMatchObject({inputTokens: 300, outputTokens: 30, totalTokens: 330});
+        // A cold-loaded session has no baseline. Its first response must not bill
+        // the historical cumulative total again.
+        state.totalTokenUsage = null;
+        delete state.tokenUsageByThread;
+        notifications = [createTokenUsageNotification(sessionId, {
+            total: breakdown(10000, 1000), last: breakdown(50, 5), modelContextWindow: 10000,
+        })];
+        expect((await agent.prompt(prompt)).usage).toMatchObject({inputTokens: 50, outputTokens: 5, totalTokens: 55});
+        // A regressing counter cannot be silently treated as complete accounting.
+        notifications = [createTokenUsageNotification(sessionId, {
+            total: breakdown(10, 1), last: breakdown(10, 1), modelContextWindow: 10000,
+        })];
+        expect((await agent.prompt(prompt)).usage).toBeNull();
+    });
+
+    it('counts interleaved root and child counters independently', async () => {
+        const state = createTestSessionState({sessionId});
+        const notify = vi.fn(async () => {});
+        const connection = {notify} as unknown as AcpClientConnection;
+        const router = new CodexSubagentEventRouter(sessionId, true, new ACPSessionConnection(connection, sessionId));
+        const handler = new CodexEventHandler(connection, state, false, false, "test", router);
+        await handler.handleNotification({method: "item/started", params: {threadId: sessionId, turnId: "turn-id", startedAtMs: 1, item: {
+            type: "collabAgentToolCall", id: "spawn", tool: "spawnAgent", senderThreadId: sessionId,
+            receiverThreadIds: ["child"], agentsStates: {}, status: "inProgress", prompt: "Help", model: null, reasoningEffort: null,
+        }}});
+        const breakdown = (tokens: number): TokenUsageBreakdown => ({totalTokens: tokens, inputTokens: tokens,
+            outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, reasoningOutputTokens: 0});
+        const event = (threadId: string, total: number, last: number) => createTokenUsageNotification(threadId, {
+            total: breakdown(total), last: breakdown(last), modelContextWindow: threadId === sessionId ? 10000 : 5000,
+        });
+        await handler.handleNotification(event(sessionId, 1000, 1000));
+        await handler.handleNotification(event('child', 100, 100));
+        await handler.handleNotification(event(sessionId, 2000, 1000));
+        await handler.handleNotification(event('child', 200, 100));
+        await handler.handleNotification(event('child', 200, 100));
+        expect(state.promptTokenUsage?.totalTokens).toBe(2200);
+        expect(state.promptUsageIncomplete).toBe(false);
+        expect(state.totalTokenUsage?.totalTokens).toBe(2000);
+        expect(state.lastTokenUsage?.totalTokens).toBe(1000);
+        expect(state.modelContextWindow).toBe(10000);
+        state.promptTokenUsage = null;
+        await handler.handleNotification(event('child', 300, 100));
+        await handler.handleNotification(event(sessionId, 2500, 500));
+        expect(state.promptTokenUsage).toMatchObject({totalTokens: 600});
+        // A fast child can finish before its transcript is materialized. Its
+        // already-observed usage remains accounted and foreign threads do not.
+        await handler.handleNotification({method: "turn/completed", params: {threadId: "child",
+            turn: {id: "child-turn", status: "completed", items: [], itemsView: "full", error: null, startedAt: null, completedAt: null, durationMs: null}}});
+        await handler.handleNotification(event("unrelated-session", 9000, 9000));
+        expect(state.promptTokenUsage).toMatchObject({totalTokens: 600});
+        expect(state.promptHasChildUsage).toBe(true);
+        // Replaying an old presentation event is not a counter regression.
+        await handler.handleNotification(event("child", 100, 100), true);
+        expect(state.promptTokenUsage).toMatchObject({totalTokens: 600});
+        expect(state.promptUsageIncomplete).toBe(false);
+    });
+
+    it.each(['collaboration', 'activity'] as const)('counts descendants before their parent %s is materialized', async (shape) => {
+        const state = createTestSessionState({sessionId});
+        const connection = {notify: vi.fn(async () => {})} as unknown as AcpClientConnection;
+        const router = new CodexSubagentEventRouter(sessionId, true, new ACPSessionConnection(connection, sessionId));
+        const handler = new CodexEventHandler(connection, state, false, false, "test", router);
+        const spawn = (parent: string, child: string): ServerNotification => ({method: "item/started", params: {
+            threadId: parent, turnId: "turn-id", startedAtMs: 1, item: shape === "activity" ? {
+                type: "subAgentActivity", id: `activity-${child}`, kind: "started",
+                agentThreadId: child, agentPath: `/root/${parent}/${child}`,
+            } : {
+                type: "collabAgentToolCall", id: `spawn-${child}`, tool: "spawnAgent", senderThreadId: parent,
+                receiverThreadIds: [child], agentsStates: {}, status: "inProgress", prompt: "Help", model: null, reasoningEffort: null,
+            },
+        }});
+        const usage = (threadId: string, tokens: number) => {
+            const breakdown: TokenUsageBreakdown = {totalTokens: tokens, inputTokens: tokens,
+                outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, reasoningOutputTokens: 0};
+            return createTokenUsageNotification(threadId, {total: breakdown, last: breakdown, modelContextWindow: 10000});
+        };
+        await handler.handleNotification(spawn(sessionId, "child"));
+        await handler.handleNotification(spawn("child", "grandchild"));
+        await handler.handleNotification(spawn("foreign", "foreign-child"));
+        await handler.handleNotification(usage(sessionId, 100));
+        await handler.handleNotification(usage("child", 10));
+        await handler.handleNotification(usage("grandchild", 7));
+        await handler.handleNotification(usage("grandchild", 7));
+        await handler.handleNotification(usage("foreign-child", 500));
+        expect(state.promptTokenUsage?.totalTokens).toBe(117);
+        expect(state.promptUsageIncomplete).toBe(false);
+        await handler.handleNotification(usage("grandchild", 7), true);
+        expect(state.promptTokenUsage?.totalTokens).toBe(117);
     });
 
     describe('session/update usage_update', () => {

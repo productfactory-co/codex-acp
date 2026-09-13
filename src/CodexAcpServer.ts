@@ -162,6 +162,10 @@ export interface SessionState {
     currentTurnId: string | null;
     lastTokenUsage: TokenCount | null;
     totalTokenUsage: TokenCount | null;
+    promptTokenUsage?: TokenCount | null;
+    tokenUsageByThread?: Map<string, TokenCount>;
+    promptUsageIncomplete?: boolean;
+    promptHasChildUsage?: boolean;
     modelContextWindow: number | null;
     rateLimits: RateLimitsMap | null;
     account: Account | null;
@@ -2753,6 +2757,9 @@ export class CodexAcpServer {
         let recoverableSessionFailure = sessionState.sessionFailure;
         sessionState.currentTurnId = null;
         const activePrompt = this.trackActivePrompt(params.sessionId);
+        sessionState.promptTokenUsage = null;
+        sessionState.promptUsageIncomplete = false;
+        sessionState.promptHasChildUsage = false;
         let pendingTurnStart: PendingTurnStart | null = null;
         const ensurePendingTurnStart = (): PendingTurnStart => {
             if (pendingTurnStart === null) {
@@ -2911,7 +2918,7 @@ export class CodexAcpServer {
                 await clearRecoveredSessionFailure(eventHandler);
                 return {
                     stopReason: "end_turn",
-                    usage: this.buildPromptUsage(sessionState.lastTokenUsage),
+                    usage: this.buildPromptUsage(sessionState.promptTokenUsage ?? null),
                     _meta: this.buildQuotaMeta(sessionState),
                 };
             }
@@ -3145,7 +3152,7 @@ export class CodexAcpServer {
 
             return {
                 stopReason: "end_turn",
-                usage: this.buildPromptUsage(sessionState.lastTokenUsage),
+                usage: this.buildPromptUsage(sessionState.promptTokenUsage ?? null),
                 _meta: this.buildQuotaMeta(sessionState),
             };
         } catch (err) {
@@ -3246,7 +3253,7 @@ export class CodexAcpServer {
     private cancelledPromptResponse(sessionState: SessionState): acp.PromptResponse {
         return {
             stopReason: "cancelled",
-            usage: this.buildPromptUsage(sessionState.lastTokenUsage),
+            usage: this.buildPromptUsage(sessionState.promptTokenUsage ?? null),
             _meta: this.buildQuotaMeta(sessionState),
         };
     }
@@ -3263,7 +3270,7 @@ export class CodexAcpServer {
         }
         return {
             stopReason: "end_turn",
-            usage: this.buildPromptUsage(sessionState.lastTokenUsage),
+            usage: this.buildPromptUsage(sessionState.promptTokenUsage ?? null),
             _meta: {
                 ...this.buildQuotaMeta(sessionState),
                 ...failureMeta,
@@ -3272,19 +3279,20 @@ export class CodexAcpServer {
     }
 
     private buildQuotaMeta(sessionState: SessionState): { quota: QuotaMeta } {
-        const lastTokenUsage = sessionState.lastTokenUsage;
+        const lastTokenUsage = sessionState.promptTokenUsage ?? null;
 
         // Remove the "[reasoning-level]" suffix from currentModelId if present
         const modelName = sessionState.currentModelId.replace(/\[.*?]$/, '');
 
-        // FIXME: currently all tokens are reported for the current model
-        const modelUsage = (lastTokenUsage != null)
+        // Child token notifications do not identify their model. Keep the aggregate
+        // but omit a model breakdown we cannot prove.
+        const modelUsage = (lastTokenUsage != null && !sessionState.promptHasChildUsage)
             ? [{ model: modelName, token_count: lastTokenUsage }]
             : [];
 
         return {
             quota: {
-                token_count: sessionState.lastTokenUsage,
+                token_count: lastTokenUsage,
                 model_usage: modelUsage
             }
         };

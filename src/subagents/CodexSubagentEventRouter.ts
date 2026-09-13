@@ -46,6 +46,7 @@ export class CodexSubagentEventRouter {
     private readonly materializationWaiters = new Map<string, Set<(sessionId: string | null) => void>>();
     private readonly replayQueue: ServerNotification[] = [];
     private readonly activeLegacyActivities = new Set<string>();
+    private readonly accountingThreads = new Set<string>();
 
     constructor(
         private readonly rootSessionId: string,
@@ -288,6 +289,26 @@ export class CodexSubagentEventRouter {
         }
         for (const childSessionId of [...this.children.keys()].reverse()) {
             await this.finish(childSessionId, state);
+        }
+    }
+
+    ownsThread(threadId: string): boolean {
+        return threadId === this.rootSessionId || this.accountingThreads.has(threadId);
+    }
+
+    observeAccountingOwnership(notification: ServerNotification): void {
+        if (notification.method !== "item/started" && notification.method !== "item/completed") return;
+        const item = notification.params.item;
+        if (!this.ownsThread(notification.params.threadId)) return;
+        const descendants = item.type === "collabAgentToolCall" && item.tool === "spawnAgent"
+            ? item.receiverThreadIds
+            : item.type === "subAgentActivity" && item.kind !== "interrupted" && !isRootAgentPath(item.agentPath)
+                ? [item.agentThreadId]
+                : [];
+        // Descendants can emit usage while their parent's discovery event is
+        // buffered. Follow the same two native discovery shapes as subscriptions.
+        for (const threadId of descendants) {
+            if (threadId.trim()) this.accountingThreads.add(threadId);
         }
     }
 
